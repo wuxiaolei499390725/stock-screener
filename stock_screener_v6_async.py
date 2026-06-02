@@ -43,7 +43,9 @@ KLINE_CACHE_DIR = CACHE_DIR / 'kline'
 KLINE_CACHE_DIR.mkdir(exist_ok=True)
 STOCK_CODES_CACHE = Path(r'C:\Users\lenovo\stock_codes_cache.csv')
 PE_CACHE_FILE = CACHE_DIR / 'pe_cache.csv'
-OUTPUT_CSV = Path(r'C:\Users\lenovo') / f'选股结果_v6_{time.strftime("%Y%m%d")}.csv'
+RESULTS_DIR = Path(__file__).parent / 'results'
+RESULTS_DIR.mkdir(exist_ok=True)
+OUTPUT_CSV = RESULTS_DIR / f'选股结果_v6_{time.strftime("%Y%m%d")}.csv'
 
 # ============================================================
 # 工具函数

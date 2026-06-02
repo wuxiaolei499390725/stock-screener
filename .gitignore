@@ -3,7 +3,11 @@ stock_codes_cache.csv
 stock_cache/
 *.csv
 
-# 输出结果
+# 结果文件不受忽略
+!results/
+!results/*.csv
+
+# 输出结果（旧路径兼容）
 选股结果_*.csv
 
 # Python
