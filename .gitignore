@@ -1,0 +1,22 @@
+# 缓存文件
+stock_codes_cache.csv
+stock_cache/
+*.csv
+
+# 输出结果
+选股结果_*.csv
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 系统文件
+.DS_Store
+Thumbs.db
