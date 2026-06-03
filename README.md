@@ -13,15 +13,21 @@
 | v4 | `stock_screener_v4_baidu.py` | 原始串行版本 |
 | v5 | `stock_screener_v5_optimized.py` | ThreadPool 并发 + O(1)查表 |
 | v6 | `stock_screener_v6_async.py` | asyncio/aiohttp + K线缓存 + PE缓存 |
+| — | `capital_flow_ranking.py` | 实时主力资金流向 TOP 20 排名 |
 
 ## 运行
 
 ```bash
-# 推荐使用 v6
+# 完整筛选（推荐使用 v6）
 python stock_screener_v6_async.py
+
+# 实时主力资金流向 TOP 20 排名
+python capital_flow_ranking.py
 ```
 
 首次运行约 10 分钟（含网络请求），二次运行利用缓存可降至 ~9 分钟。
+
+资金流向排名脚本仅需 ~2 秒（单次批量 API 调用）。
 
 ## 数据源
 

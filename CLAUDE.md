@@ -7,11 +7,13 @@
 - `stock_screener_v4_baidu.py` — 原始串行版本（基线）
 - `stock_screener_v5_optimized.py` — ThreadPool 并发版（O(1)查表、重试）
 - `stock_screener_v6_async.py` — asyncio/aiohttp 终极版（K线缓存、PE缓存、多路并发）**推荐使用**
+- `capital_flow_ranking.py` — 实时主力资金流向排名（全市场 TOP 20 流入/流出）
 
 ## 运行
 ```bash
 cd ~/stock-screener
-python stock_screener_v6_async.py
+python stock_screener_v6_async.py        # 完整筛选
+python capital_flow_ranking.py           # 实时资金流向排名
 ```
 
 ## 技术栈
