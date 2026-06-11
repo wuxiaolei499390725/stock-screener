@@ -1,15 +1,13 @@
 """
-A股量化筛选 v6：终极优化版 (asyncio + aiohttp)
+A股量化筛选 v7：智能质量过滤版 (asyncio + aiohttp)
 ======================================================================
-优化点:
-1. asyncio + aiohttp 异步并发 (替代 ThreadPoolExecutor)
-2. K线数据本地缓存 (同日重复运行秒级完成 Step 3)
-3. Step2 PE批量查询并行化 (70批 -> 5路并发)
-4. 智能信号量控制 (不同API不同并发上限)
-5. PE数据缓存 (1小时有效)
-6. 自动重试 + 指数退避
+v7 新增:
+1. 市值过滤：总市值 >= 50亿（过滤微型股）
+2. 资金流入强度：20日净流入占比 > 0.5%（过滤资金面无实质改善者）
+3. 质量评分：综合 PE/市值/流入强度/趋势持续性 四维评分
+4. 按质量分降序输出 + 标注潜在风险（北交所、ST、次新）
 ======================================================================
-条件：PE<20 + MACD向上 + 5/10/15/20日主力资金净流入均为正
+条件: PE 0~20 + 市值>=50亿 + MACD向上 + 资金流入质量通过
 """
 import asyncio
 import aiohttp
@@ -25,7 +23,7 @@ from pathlib import Path
 # ============================================================
 # 配置
 # ============================================================
-PROXY = 'http://127.0.0.1:7890'
+PROXY = None  # 国内API直连即可，无需代理
 UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
 
 # 并发控制 (不同数据源不同限制)
@@ -37,15 +35,23 @@ REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=20)
 MAX_RETRIES = 2
 
 # 缓存配置
-CACHE_DIR = Path(r'C:\Users\lenovo\stock_cache')
+CACHE_DIR = Path(__file__).parent / 'stock_cache'
 CACHE_DIR.mkdir(exist_ok=True)
 KLINE_CACHE_DIR = CACHE_DIR / 'kline'
 KLINE_CACHE_DIR.mkdir(exist_ok=True)
-STOCK_CODES_CACHE = Path(r'C:\Users\lenovo\stock_codes_cache.csv')
+STOCK_CODES_CACHE = Path(__file__).parent / 'stock_codes_cache.csv'
 PE_CACHE_FILE = CACHE_DIR / 'pe_cache.csv'
 RESULTS_DIR = Path(__file__).parent / 'results'
 RESULTS_DIR.mkdir(exist_ok=True)
-OUTPUT_CSV = RESULTS_DIR / f'选股结果_v6_{time.strftime("%Y%m%d")}.csv'
+OUTPUT_CSV = RESULTS_DIR / f'选股结果_v7_{time.strftime("%Y%m%d")}.csv'
+
+# ═══ 质量过滤阈值 ═══
+MIN_MARKET_CAP = 50        # 最小市值(亿)，过滤微型股和北交所垃圾股
+MIN_FLOW_RATIO = 0.1       # 20日净流入占市值最低比例(%)，确保资金面真实改善
+PE_MIN = 0                 # PE下限，0=不限制(排除亏损股可设>0)
+PE_MAX = 20                # PE上限
+EXCLUDE_BJ = False         # 是否排除北交所(True=排除，False=保留但标注)
+EXCLUDE_ST = True          # 排除ST股
 
 # ============================================================
 # 工具函数
@@ -455,33 +461,46 @@ async def fetch_fund_flow(session, code, sem):
 
 
 async def process_one_flow(session, stock, sem):
-    """单只股票资金流分析"""
+    """单只股票资金流分析 + 质量评分，返回 (result_dict, reason_str)"""
     code = stock['code']
+    market_cap = stock.get('market_cap', 0) or 1
     for attempt in range(MAX_RETRIES + 1):
         try:
             flow = await fetch_fund_flow(session, code, sem)
-            if flow:
-                f5, f10, f15, f20 = flow['flow_5d'], flow['flow_10d'], flow['flow_15d'], flow['flow_20d']
-                if f5 > 0 and f10 > 0 and f15 > 0 and f20 > 0:
-                    return {
-                        '代码': code.replace('sh', '').replace('sz', '').replace('bj', ''),
-                        '名称': stock['name'],
-                        '市盈率': round(stock['pe'], 2),
-                        'DIF': stock['dif'],
-                        'DEA': stock['dea'],
-                        'MACD柱': stock['macd_bar'],
-                        '5日净流入(万)': f5,
-                        '10日净流入(万)': f10,
-                        '15日净流入(万)': f15,
-                        '20日净流入(万)': f20,
-                        '总市值(亿)': round(stock['market_cap'], 2) if stock['market_cap'] else '',
-                    }
-            if attempt < MAX_RETRIES:
-                await asyncio.sleep(0.3)
+            if not flow:
+                if attempt < MAX_RETRIES: await asyncio.sleep(0.3); continue
+                return None, 'no_data'
+            f5, f10, f15, f20 = flow['flow_5d'], flow['flow_10d'], flow['flow_15d'], flow['flow_20d']
+            # ── 基本流入条件 ──
+            if not (f5 > 0 and f10 > 0 and f15 > 0 and f20 > 0):
+                return None, 'flow_dir_fail'
+            # ── 流入强度 ──
+            flow_ratio = (f20 / (market_cap * 10000)) * 100 if market_cap > 0 else 0
+            if flow_ratio < MIN_FLOW_RATIO:
+                return None, 'ratio_fail'
+            # ── 质量评分 ──
+            trend_score = min(f5 / f20 if f20 > 0 else 0, 1.0) * 100
+            quality = (
+                min(20, (20 - stock['pe']) * 1.0) +
+                min(25, flow_ratio * 5) +
+                min(25, trend_score * 0.5) +
+                min(15, market_cap / 200) +
+                (15 if stock.get('macd_bar', 0) > 0.05 else 10)
+            )
+            return {
+                '代码': code.replace('sh', '').replace('sz', '').replace('bj', ''),
+                '名称': stock['name'], '市盈率': round(stock['pe'], 2),
+                'DIF': stock['dif'], 'DEA': stock['dea'], 'MACD柱': stock['macd_bar'],
+                '5日净流入(万)': f5, '10日净流入(万)': f10,
+                '15日净流入(万)': f15, '20日净流入(万)': f20,
+                '总市值(亿)': round(market_cap, 2),
+                '流入占比%': round(flow_ratio, 2), '趋势加速%': round(trend_score, 1),
+                '质量评分': round(quality, 1),
+                '北交所': '是' if stock.get('is_bj') else '',
+            }, 'pass'
         except Exception:
-            if attempt < MAX_RETRIES:
-                await asyncio.sleep(0.3)
-    return None
+            if attempt < MAX_RETRIES: await asyncio.sleep(0.3)
+    return None, 'no_data'
 
 
 async def step4_fund_flow(macd_pass):
@@ -494,28 +513,35 @@ async def step4_fund_flow(macd_pass):
     lock = asyncio.Lock()
     results = []
     completed = 0
+    diag = {'no_data': 0, 'flow_dir_fail': 0, 'ratio_fail': 0, 'pass': 0}
     start_time = time.time()
 
     async def worker(stock):
         nonlocal completed
-        result = await process_one_flow(session, stock, sem)
+        result, reason = await process_one_flow(session, stock, sem)
         async with lock:
             nonlocal completed
             completed += 1
             if result:
                 results.append(result)
+                diag['pass'] += 1
+            else:
+                diag[reason] = diag.get(reason, 0) + 1
             if completed % 20 == 0 or completed == len(macd_pass):
                 elapsed = time.time() - start_time
                 rate = completed / elapsed if elapsed > 0 else 0
                 eta = (len(macd_pass) - completed) / rate if rate > 0 else 0
-                print(f"  [{completed}/{len(macd_pass)}] 全部满足: {len(results)} | "
-                      f"速度: {rate:.1f}只/s | 预计剩余: {eta:.0f}s")
+                print(f"  [{completed}/{len(macd_pass)}] 通过: {diag['pass']} | "
+                      f"无数据:{diag['no_data']} 流向不符:{diag['flow_dir_fail']} 占比不足:{diag['ratio_fail']} | "
+                      f"速度: {rate:.1f}只/s")
 
     connector = aiohttp.TCPConnector(limit=EM_CONCURRENT * 2)
     async with aiohttp.ClientSession(connector=connector) as session:
         tasks = [worker(s) for s in macd_pass]
         await asyncio.gather(*tasks)
 
+    print(f"  [诊断] 无数据:{diag['no_data']}  流向不符:{diag['flow_dir_fail']}  "
+          f"占比不足(<{MIN_FLOW_RATIO}%):{diag['ratio_fail']}  通过:{diag['pass']}")
     return results
 
 
@@ -531,21 +557,36 @@ async def main():
     # Step 2: PE查询 (异步并行批次)
     pe_data = await step2_fetch_pe(stock_codes, stock_names)
 
-    # PE < 20 筛选
+    # PE + 市值 筛选
     pe_lt_20 = []
+    cap_filtered = 0
+    st_filtered = 0
+    bj_count = 0
     for code, info in pe_data.items():
-        if 0 < info['pe'] < 20:
-            name = info.get('name', stock_names.get(code, ''))
-            if 'ST' in name or '退' in name or name.startswith('N'):
-                continue
-            pe_lt_20.append({
-                'code': code, 'name': name,
-                'pe': info['pe'], 'market_cap': info['market_cap']
-            })
+        pe_val = info['pe']
+        cap_val = info['market_cap']
+        name = info.get('name', stock_names.get(code, ''))
+        # ── 基础过滤 ──
+        if EXCLUDE_ST and ('ST' in name or '退' in name or name.startswith('N')):
+            st_filtered += 1; continue
+        if not (PE_MIN < pe_val < PE_MAX):
+            continue
+        # ── 市值过滤 ──
+        if cap_val < MIN_MARKET_CAP:
+            cap_filtered += 1; continue
+        # ── 北交所标记 ──
+        is_bj = code.startswith('bj') or code.startswith('8') or code.startswith('4')
+        if is_bj: bj_count += 1
+        pe_lt_20.append({
+            'code': code, 'name': name,
+            'pe': pe_val, 'market_cap': cap_val,
+            'is_bj': is_bj
+        })
 
-    print(f"\n0 < PE < 20: {len(pe_lt_20)} 只")
+    print(f"\n{PE_MIN} < PE < {PE_MAX} + 市值>={MIN_MARKET_CAP}亿: {len(pe_lt_20)} 只")
+    print(f"  市值过滤掉: {cap_filtered} 只  ST过滤: {st_filtered} 只  北交所: {bj_count} 只")
     if len(pe_lt_20) == 0:
-        print("无符合PE条件的股票，退出")
+        print("无符合PE+市值条件的股票，退出")
         return
 
     # Step 3: MACD分析 (异步 + 缓存)
@@ -565,21 +606,60 @@ async def main():
     print("=" * 60)
 
     if results:
+        # ── 按质量评分降序排列 ──
         df_out = pd.DataFrame(results).sort_values(
-            '20日净流入(万)', ascending=False).reset_index(drop=True)
-        print("\n" + df_out.to_string(max_rows=100))
+            '质量评分', ascending=False).reset_index(drop=True)
 
+        # 分档标记 (ASCII 兼容终端)
+        def grade_tag(score):
+            if score >= 80: return '[A]'
+            if score >= 65: return '[B]'
+            return '[C]'
+        df_out['评级'] = df_out['质量评分'].apply(grade_tag)
+
+        # 北交所风险标记
+        bj_mask = df_out['北交所'] == '是'
+        df_out['风险提示'] = ''
+        df_out.loc[bj_mask, '风险提示'] = '!北交所'
+
+        # 打印核心列
+        display_cols = ['评级', '代码', '名称', '市盈率', '总市值(亿)',
+                        '20日净流入(万)', '流入占比%', '趋势加速%', '质量评分']
+        if bj_mask.any():
+            display_cols.insert(-1, '风险提示')
+        print("\n" + df_out[display_cols].to_string(max_rows=100))
+
+        # 保存完整数据
         df_out.to_csv(OUTPUT_CSV, index=False, encoding='utf-8-sig')
         print(f"\n[OK] 结果已保存: {OUTPUT_CSV}")
-        print(f"\n>> PE范围: {df_out['市盈率'].min():.1f} ~ {df_out['市盈率'].max():.1f}")
-        print(f">> 20日净流入范围: {df_out['20日净流入(万)'].min():.0f}万 ~ {df_out['20日净流入(万)'].max():.0f}万")
 
-        # 缓存统计
+        # ── 增强统计 ──
+        print(f"\n{'='*60}")
+        print(f"  质量分布")
+        print(f"{'='*60}")
+        a_cnt = (df_out['质量评分']>=80).sum()
+        b_cnt = ((df_out['质量评分']>=65)&(df_out['质量评分']<80)).sum()
+        c_cnt = (df_out['质量评分']<65).sum()
+        print(f"  [A] >=80分: {a_cnt} 只 -- 强烈推荐")
+        print(f"  [B] 65-79:  {b_cnt} 只 -- 关注")
+        print(f"  [C] <65:    {c_cnt} 只 -- 观察")
+        print(f"  PE: {df_out['市盈率'].min():.1f}~{df_out['市盈率'].max():.1f}")
+        print(f"  市值: {df_out['总市值(亿)'].min():.0f}~{df_out['总市值(亿)'].max():.0f}亿")
+        print(f"  20日净流入: {df_out['20日净流入(万)'].min():.0f}~{df_out['20日净流入(万)'].max():.0f}万")
+
+        # Top 5 推荐
+        top5 = df_out.head(5)
+        print(f"\n  >> 质量评分 TOP 5:")
+        for _, r in top5.iterrows():
+            print(f"    {r['评级']} {r['代码']} {r['名称']:<6s}  "
+                  f"PE={r['市盈率']}  流入占比={r['流入占比%']}%  评分={r['质量评分']}")
+
         kline_cached = sum(1 for f in KLINE_CACHE_DIR.iterdir() if f.suffix == '.csv')
-        print(f">> K线缓存文件数: {kline_cached}")
+        print(f"\n  K线缓存: {kline_cached} 个")
     else:
         print("[WARN] 无股票满足全部条件")
-        print("   建议: 放宽PE上限、仅要求近5/10日流入、或放宽MACD条件")
+        print("   建议: 放宽PE上限、降低市值门槛、放宽流入占比要求")
+        print(f"   当前阈值: PE<{PE_MAX} 市值>={MIN_MARKET_CAP}亿 流入占比>={MIN_FLOW_RATIO}%")
 
 
 if __name__ == '__main__':

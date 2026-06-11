@@ -18,18 +18,25 @@ import urllib.request
 import urllib.parse
 import json
 import time
+import socket
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
+
+# 强制 IPv4（push2.eastmoney.com 的 IPv6 会拒绝连接）
+_orig_getaddrinfo = socket.getaddrinfo
+def _getaddrinfo_v4(host, port, family=0, *args, **kwargs):
+    return _orig_getaddrinfo(host, port, socket.AF_INET, *args, **kwargs)
+socket.getaddrinfo = _getaddrinfo_v4
 
 # ============================================================
 # 配置
 # ============================================================
 UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-PROXY = 'http://127.0.0.1:7890'
+PROXY = None  # 国内API直连即可，无需代理
 REQUEST_TIMEOUT = 15
 MAX_RETRIES = 3
-PAGE_DELAY = 0.1  # 分页间延迟（秒），防限流
+PAGE_DELAY = 1.5  # 分页间延迟（秒），防限流
 
 RESULTS_DIR = Path(__file__).parent / 'results'
 RESULTS_DIR.mkdir(exist_ok=True)
@@ -47,6 +54,8 @@ FIELDS = 'f2,f3,f12,f14,f15,f16,f17,f18,f20,f21,f62,f66,f72,f78,f84,f184'
 # ============================================================
 
 _proxy_handler = urllib.request.ProxyHandler({'http': PROXY, 'https': PROXY})
+_no_proxy_handler = urllib.request.ProxyHandler({})  # 空 dict = 直连，绕过系统代理
+_direct_opener = urllib.request.build_opener(_no_proxy_handler)
 
 
 def safe_float(val, default=0.0):
@@ -69,9 +78,9 @@ def http_get(url, params=None, timeout=REQUEST_TIMEOUT,
         headers['Referer'] = referer
     req = urllib.request.Request(url, headers=headers)
 
-    # 先试直连
+    # 先试直连（绕过系统代理）
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _direct_opener.open(req, timeout=timeout) as resp:
             return resp.read().decode(decode)
     except Exception:
         pass
